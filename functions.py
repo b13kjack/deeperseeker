@@ -1693,6 +1693,99 @@ async def create_new_chat(auth_token):
     return data["data"]["biz_data"]["chat_session"]["id"]
 
 
+_EMPTY_SSE_DEFAULT = (
+    "Empty response from DeepSeek (no parseable SSE content): "
+    "stream ended with no assistant fragments"
+)
+_EMPTY_SSE_CONTEXT = (
+    "Empty response from DeepSeek (prompt may exceed the session context limit)"
+)
+_CONTEXT_LIMIT_HINT_RE = re.compile(
+    r"context|token.?limit|maximum.?context|too.?long|exceed",
+    re.IGNORECASE,
+)
+_SSE_RECENT_LINES = 8
+
+
+class _SseStreamFinished(Exception):
+    pass
+
+
+def _redact_sse_line(line: str) -> str:
+    if len(line) > 500:
+        return line[:500] + "..."
+    return line
+
+
+def _remember_sse_line(recent_lines, line: str):
+    recent_lines.append(_redact_sse_line(line))
+    if len(recent_lines) > _SSE_RECENT_LINES:
+        del recent_lines[0]
+
+
+def _sse_context_limit_hint(recent_lines, parsed_events):
+    for obj in parsed_events:
+        try:
+            blob = json.dumps(obj, ensure_ascii=False)
+        except Exception:
+            blob = str(obj)
+        if _CONTEXT_LIMIT_HINT_RE.search(blob):
+            return True
+    for line in recent_lines:
+        if _CONTEXT_LIMIT_HINT_RE.search(line):
+            return True
+    return False
+
+
+def _scan_recent_sse_errors(parsed_events):
+    """Return (http_status, message) if a recent parsed event is an upstream error."""
+    for obj in reversed(parsed_events):
+        if not isinstance(obj, dict) or obj.get("type") != "error":
+            continue
+        content = obj.get("content") or obj.get("message") or "Upstream error"
+        finish = str(obj.get("finish_reason") or "")
+        if finish == "rate_limit_reached" or "rate_limit" in finish.lower():
+            return 429, content
+        if finish in ("permission_denied", "forbidden"):
+            return 403, content
+        return 502, content
+    return None
+
+
+def _raise_empty_sse_response(recent_lines, parsed_events):
+    err = _scan_recent_sse_errors(parsed_events)
+    if err:
+        code, msg = err
+        logger.warning(
+            "DeepSeek SSE error event (not empty stream); last events: %s",
+            recent_lines[-_SSE_RECENT_LINES:],
+        )
+        raise Exception(f"HTTP {code}: {msg}")
+    if _sse_context_limit_hint(recent_lines, parsed_events):
+        msg = _EMPTY_SSE_CONTEXT
+    else:
+        msg = _EMPTY_SSE_DEFAULT
+    logger.warning(
+        "DeepSeek SSE ended without assistant output; last events: %s",
+        recent_lines[-_SSE_RECENT_LINES:],
+    )
+    raise Exception(msg)
+
+
+def _raise_sse_error_event(data, recent_lines):
+    content = data.get("content") or data.get("message") or "Upstream error"
+    finish = str(data.get("finish_reason") or "")
+    if finish == "rate_limit_reached" or "rate_limit" in finish.lower():
+        logger.warning(
+            "DeepSeek SSE error event (not empty stream); last events: %s",
+            recent_lines[-_SSE_RECENT_LINES:],
+        )
+        raise Exception(f"HTTP 429: {content}")
+    if finish in ("permission_denied", "forbidden"):
+        raise Exception(f"HTTP 403: {content}")
+    raise Exception(f"HTTP 502: {content}")
+
+
 async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None):
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
@@ -1791,36 +1884,43 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
             logger.warning("DeepSeek completion HTTP %d for chat %s: %s", resp.status, chat_id, error_text[:300])
             raise Exception(f"HTTP {resp.status}: {error_text}")
 
-        async for line in resp.content:
-            if not line:
-                continue
-            decoded_line = line.decode("utf-8").strip()
-            if not decoded_line.startswith("data: "):
-                continue
-            try:
-                data = json.loads(decoded_line[6:])
-            except Exception:
-                continue
-            # Upstream error frames (e.g. {"type":"error","content":"Messages
-            # too frequent. Try again later.","finish_reason":
-            # "rate_limit_reached"}). Previously these fell through every
-            # branch below, so a rate-limited request surfaced as the
-            # misleading "Empty response ... (prompt may exceed the session
-            # context limit)" 502 and the token was never marked limited.
-            # Raising HTTP 429 here engages handle_chat's rotation/retry path.
-            _err_content = _err_reason = None
-            _v_obj = data.get("v")
-            if isinstance(_v_obj, dict) and _v_obj.get("type") == "error":
-                _err_content = _v_obj.get("content", "")
-                _err_reason = _v_obj.get("finish_reason", "")
-            elif data.get("type") == "error":
-                _err_content = data.get("content", "")
-                _err_reason = data.get("finish_reason", "")
-            if _err_content is not None:
-                _msg = str(_err_content)[:200]
-                if "frequent" in _msg or "rate_limit" in str(_err_reason):
-                    raise Exception(f"HTTP 429: DeepSeek rate limited ({_msg})")
-                raise Exception(f"Upstream error: {_msg}")
+        recent_lines = []
+        parsed_events = []
+        line_buf = b""
+
+        async def _emit_fragment(content, kind):
+            nonlocal think_open, got_output
+            if _is_repeat_loop(content):
+                logger.warning(
+                    "DeepSeek repetition loop detected for chat %s (%s fragment "
+                    "repeated %d+ times); closing the stream early",
+                    chat_id, kind, _REPEAT_THRESHOLD,
+                )
+                for part in _finish_stream():
+                    yield part
+                raise _SseStreamFinished()
+            if kind == "THINK":
+                if not think_open:
+                    think_open = True
+                    for part in _push("<think>\n"):
+                        yield part
+                got_output = True
+                for part in _push(content):
+                    yield part
+                return
+            if think_open:
+                think_open = False
+                _push("\n</think>\n\n")
+            got_output = True
+            for part in _release():
+                yield part
+            if content:
+                yield content
+
+        async def _emit_from_event(data):
+            nonlocal think_open, got_output
+            if not isinstance(data, dict):
+                return
             if _frame_is_content_filter(data):
                 # Drop the held think prefix. The caller retries this
                 # completion on the next token; the client must not see the
@@ -1830,96 +1930,54 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                     chat_id,
                 )
                 raise ContentFiltered(chat_id)
-            __got_before = got_output
-            if data.get("p") == "response/status" and data.get("v") == "FINISHED":
-                if not got_output:
-                    raise Exception("Empty response from DeepSeek (prompt may exceed the session context limit)")
-                for part in _finish_stream():
-                    yield part
-                return
+
+            err_obj = data if data.get("type") == "error" else None
+            v_obj = data.get("v")
+            if err_obj is None and isinstance(v_obj, dict) and v_obj.get("type") == "error":
+                err_obj = v_obj
+            if err_obj is not None:
+                _raise_sse_error_event(err_obj, recent_lines)
+
             if data.get("o") == "BATCH" and isinstance(data.get("v"), list):
                 for op in data["v"]:
-                    if isinstance(op, dict) and op.get("p") == "quasi_status" and op.get("v") == "FINISHED":
-                        if not got_output:
-                            raise Exception("Empty response from DeepSeek (prompt may exceed the session context limit)")
-                        for part in _finish_stream():
-                            yield part
-                        return
+                    if not isinstance(op, dict):
+                        continue
+                    # quasi_status FINISHED can precede the real fragments in
+                    # the same batch. Skip it here; response/status FINISHED
+                    # (or EOF) ends the stream after those fragments.
+                    if op.get("p") == "quasi_status" and op.get("v") == "FINISHED":
+                        continue
+                    async for chunk in _emit_from_event(op):
+                        yield chunk
+                return
+
+            if data.get("p") == "response/status" and data.get("v") == "FINISHED":
+                if not got_output:
+                    _raise_empty_sse_response(recent_lines, parsed_events)
+                for part in _finish_stream():
+                    yield part
+                raise _SseStreamFinished()
+
             if "v" in data and isinstance(data["v"], dict) and "response" in data["v"]:
                 fragments = data["v"]["response"].get("fragments")
                 if fragments:
                     for fragment in fragments:
                         content = fragment.get("content", "")
-                        if fragment.get("type") == "THINK":
-                            if _is_repeat_loop(content):
-                                logger.warning(
-                                    "DeepSeek repetition loop detected for chat %s (THINK fragment "
-                                    "repeated %d+ times); closing the stream early", chat_id, _REPEAT_THRESHOLD,
-                                )
-                                for part in _finish_stream():
-                                    yield part
-                                return
-                            if not think_open:
-                                think_open = True
-                                _push("<think>\n")
-                            got_output = True
-                            for part in _push(content):
-                                yield part
-                        else:
-                            if _is_repeat_loop(content):
-                                logger.warning(
-                                    "DeepSeek repetition loop detected for chat %s (fragment repeated "
-                                    "%d+ times); closing the stream early", chat_id, _REPEAT_THRESHOLD,
-                                )
-                                for part in _finish_stream():
-                                    yield part
-                                return
-                            if think_open:
-                                think_open = False
-                                _push("\n</think>\n\n")
-                            got_output = True
-                            for part in _release():
-                                yield part
-                            if content:
-                                yield content
-                continue
+                        kind = "THINK" if fragment.get("type") == "THINK" else "RESPONSE"
+                        async for part in _emit_fragment(content, kind):
+                            yield part
+                return
 
             if data.get("p") == "response/fragments" and data.get("o") == "APPEND":
                 fragments = data.get("v")
                 if isinstance(fragments, list):
                     for fragment in fragments:
                         content = fragment.get("content", "")
-                        if _is_repeat_loop(content):
-                            logger.warning(
-                                "DeepSeek repetition loop detected for chat %s (fragment repeated "
-                                "%d+ times); closing the stream early", chat_id, _REPEAT_THRESHOLD,
-                            )
-                            for part in _finish_stream():
-                                yield part
-                            return
-                        if fragment.get("type") == "RESPONSE":
-                            if think_open:
-                                think_open = False
-                                _push("\n</think>\n\n")
-                            got_output = True
-                            for part in _release():
-                                yield part
-                            if content:
-                                yield content
-                        elif fragment.get("type") == "THINK":
-                            if not think_open:
-                                think_open = True
-                                _push("<think>\n")
-                            got_output = True
-                            for part in _push(content):
-                                yield part
-                        else:
-                            got_output = True
-                            for part in _release():
-                                yield part
-                            if content:
-                                yield content
-                continue
+                        ftype = fragment.get("type")
+                        kind = "THINK" if ftype == "THINK" else ("RESPONSE" if ftype == "RESPONSE" else "OTHER")
+                        async for part in _emit_fragment(content, kind):
+                            yield part
+                return
 
             v = data.get("v")
             if isinstance(v, str) and v:
@@ -1930,7 +1988,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                     )
                     for part in _finish_stream():
                         yield part
-                    return
+                    raise _SseStreamFinished()
                 got_output = True
                 if think_open and not _released:
                     _push(v)
@@ -1938,22 +1996,63 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                     for part in _release():
                         yield part
                     yield v
+
+        async def _consume_sse_line(decoded_line: str):
+            if not decoded_line.startswith("data: "):
+                return
+            _remember_sse_line(recent_lines, decoded_line)
+            try:
+                data = json.loads(decoded_line[6:])
+            except Exception:
+                return
+            if isinstance(data, dict):
+                parsed_events.append(data)
+                if len(parsed_events) > _SSE_RECENT_LINES:
+                    del parsed_events[0]
+            async for chunk in _emit_from_event(data):
+                yield chunk
+
+        content = resp.content
+        if hasattr(content, "iter_any"):
+            byte_iter = content.iter_any()
+        else:
+            async def _as_bytes():
+                async for piece in content:
+                    if isinstance(piece, str):
+                        yield piece.encode("utf-8")
+                    elif piece:
+                        yield piece
+            byte_iter = _as_bytes()
+
+        async for chunk in byte_iter:
+            if not chunk:
                 continue
-            if got_output == __got_before:
-                # Reaching here means this frame matched no branch above and
-                # its content (if any) was dropped. Log the shape (capped)
-                # so cut-reply reports can be diagnosed from server logs.
-                _unhandled[0] += 1
-                if _unhandled[0] <= 3:
-                    logger.warning(
-                        "DeepSeek unhandled frame #%d for chat %s (o=%r p=%r): %s",
-                        _unhandled[0], chat_id, data.get("o"), data.get("p"),
-                        decoded_line[6:250],
-                    )
-        if not got_output:
-            raise Exception("Empty response from DeepSeek (prompt may exceed the session context limit)")
+            line_buf += chunk
+            while b"\n" in line_buf:
+                raw_line, line_buf = line_buf.split(b"\n", 1)
+                decoded_line = raw_line.decode("utf-8", errors="replace").strip()
+                if not decoded_line:
+                    continue
+                try:
+                    async for out in _consume_sse_line(decoded_line):
+                        yield out
+                except _SseStreamFinished:
+                    return
+
+        if line_buf.strip():
+            decoded_line = line_buf.decode("utf-8", errors="replace").strip()
+            if decoded_line:
+                try:
+                    async for out in _consume_sse_line(decoded_line):
+                        yield out
+                except _SseStreamFinished:
+                    return
+
         for part in _finish_stream():
             yield part
+        if not got_output:
+            _raise_empty_sse_response(recent_lines, parsed_events)
+
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):

@@ -393,9 +393,13 @@ def check_key(request: Request):
     return secrets.compare_digest(key.encode("utf-8"), API_KEY.encode("utf-8"))
 
 
+def _upstream_http_code(exc):
+    m = re.match(r"HTTP (\d{3}):", str(exc))
+    return int(m.group(1)) if m else None
+
+
 def _api_error_response(e, is_anthropic=False):
-    m = re.match(r"HTTP (\d{3}):", str(e))
-    code = int(m.group(1)) if m else 502
+    code = _upstream_http_code(e) or 502
     if isinstance(e, CookieGenerationError):
         code = 503  # WAF cookies cannot be produced right now — upstream unreachable, not a client error
     if code < 400 or code > 599:
@@ -403,7 +407,8 @@ def _api_error_response(e, is_anthropic=False):
     if is_anthropic:
         payload = {"type": "error", "error": {"type": "api_error", "message": str(e)[:500]}}
     else:
-        payload = {"error": {"message": str(e)[:500], "type": "api_error", "code": code}}
+        err_type = "rate_limit_error" if code == 429 else "api_error"
+        payload = {"error": {"message": str(e)[:500], "type": err_type, "code": code}}
     return JSONResponse(payload, status_code=code)
 
 
@@ -664,6 +669,24 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         return JSONResponse({"error": "Token expired"}, status_code=503)
     _set_key_name(tok.get("alias"))
 
+    # Existing upstream chat whose accumulated context no longer fits: summarize
+    # into a scratch chat, then continue this signature on a fresh session.
+    # Done before the chat lock so the lock is taken on the new session id.
+    if parent_message_id != 0 and needs_rollover(messages):
+        logger.info(
+            "Context rollover: accumulated context over limit; purging session mappings for chat %s",
+            session_id,
+        )
+        await _db_call(delete_sessions_for_chat, token_id, session_id)
+        scratch_chat = await create_new_chat(tok["token"])
+        summary_gen = send_message(
+            scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
+        )
+        rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
+        session_id = await create_new_chat(tok["token"])
+        await _db_call(save_session, sig, token_id, session_id, 0)
+        parent_message_id = 0
+
     # Stage 0.3: hold this chat's lock across the whole send -> save critical
     # section; for streams, ownership transfers to the response generator via
     # _release_chat_lock_stream (the final save_session happens there).
@@ -713,15 +736,19 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             await _save_turn(sig, next_messages, model, scope, token_id, session_id, parent_message_id)
             return format_response(resp_text, model, messages, tools)
     except Exception as e:
-        logger.exception("Chat request failed (session %s, parent %s): %s", session_id, parent_message_id, e)
-        m = re.match(r"HTTP (\d{3}):", str(e))
-        code = int(m.group(1)) if m else None
+        code = _upstream_http_code(e)
         if code in (401, 403, 429):
             await _db_call(mark_limited, token_id)
+            logger.warning(
+                "Chat request rejected by upstream (session %s, parent %s): %s",
+                session_id, parent_message_id, e,
+            )
+        else:
+            logger.exception("Chat request failed (session %s, parent %s): %s", session_id, parent_message_id, e)
         await _db_call(delete_sessions_for_chat, token_id, session_id)
         if isinstance(e, ContentFiltered):
-            # Same deadlock rule as the rate-limit retry below: release this
-            # chat's lock before the recursive call re-resolves a session.
+            # Same deadlock rule as the retry below: release this chat's lock
+            # before the recursive call re-resolves a session.
             lock_owner.release()
             return await _retry_after_content_filter(
                 e, token_id, _skip_token_ids, messages, model, thinking, search, stream,
@@ -729,17 +756,11 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             )
         if _retried:
             return _api_error_response(e, is_anthropic)
-        if code not in (401, 403, 429) and parent_message_id == 0:
-            return _api_error_response(e, is_anthropic)
-        # PR #26 review fix (Blocker 2 — retry self-deadlock): the recursive
-        # call can resolve to the SAME chat (the retry re-derives the session
-        # from whatever the persistence layer still returns). Recursing while
-        # this frame still owns the lock made the retry wait on a lock its own
-        # caller held — the request hung until the client gave up, on exactly
-        # the errors the retry exists for. Surrender the lock first: release()
-        # is scoped to this holder and idempotent, so the finally below becomes
-        # a no-op, the retry re-acquires cleanly, and queued same-chat requests
-        # are no longer starved for the entire retry either.
+        # Retry once, including a first message (parent 0). An empty upstream
+        # SSE used to be reported as a context-limit 502 and never retried.
+        # Surrender the lock first: release() is scoped to this holder and
+        # idempotent, so the finally below becomes a no-op and the retry
+        # re-acquires cleanly.
         lock_owner.release()
         return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True, _skip_token_ids=_skip_token_ids)
     finally:
@@ -869,17 +890,21 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         raise
     except Exception as e:
         failed = True
-        m = re.match(r"HTTP (\d{3}):", str(e))
-        code = int(m.group(1)) if m else None
+        code = _upstream_http_code(e)
         if isinstance(e, ContentFiltered):
             # Filter arrived after visible content was already flushed. The
             # HTTP response is committed, so this turn cannot swap tokens;
             # drop the session so the next request does not resume it.
             logger.warning("CONTENT_FILTER after stream start on token %s; dropping session %s", token_id, session_id)
-            await _db_call(delete_sessions_for_chat, token_id, session_id)
         elif code in (401, 403, 429):
             await _db_call(mark_limited, token_id)
-        logger.exception("stream_response failed")
+            logger.warning("stream_response upstream HTTP %s: %s", code, e)
+        else:
+            logger.exception("stream_response failed")
+        try:
+            await _db_call(delete_sessions_for_chat, token_id, session_id)
+        except Exception:
+            logger.exception("stream_response: dropping session %s failed", session_id)
         try:
             yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
         except Exception:
@@ -913,7 +938,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                     "stream_response: persisting turn failed (non-fatal; stream will still terminate)"
                 )
 
-        if not aborted:
+        if not aborted and not failed:
             try:
                 if not effective_tools:
                     for part in flush_text_parts:
@@ -925,11 +950,25 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                                     "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}
                         yield _chunk({"tool_calls": [delta_tc]})
                     yield _chunk({}, "tool_calls")
-                elif not failed:
+                else:
                     yield _chunk({}, "stop")
-                # Always terminate the SSE stream, even after an error chunk:
-                # without [DONE] strict OpenAI clients treat the disconnect
-                # as truncation and spin into continuation retries.
+                # OpenAI-compatible gateways (New API, sub2api, ...) bill from a
+                # trailing usage chunk whose choices array is empty. Skipped on
+                # aborted/failed streams so a partial response is not billed.
+                in_tokens = count_tok(_messages_text(messages))
+                out_tokens = count_tok(full_text)
+                yield (
+                    "data: "
+                    + json.dumps({
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": in_tokens,
+                            "completion_tokens": out_tokens,
+                            "total_tokens": in_tokens + out_tokens,
+                        },
+                    })
+                    + "\n\n"
+                )
                 yield "data: [DONE]\n\n"
             except asyncio.CancelledError:
                 pass
@@ -1006,14 +1045,18 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         raise
     except Exception as e:
         failed = True
-        m = re.match(r"HTTP (\d{3}):", str(e))
-        code = int(m.group(1)) if m else None
+        code = _upstream_http_code(e)
         if isinstance(e, ContentFiltered):
             logger.warning("CONTENT_FILTER after stream start on token %s; dropping session %s", token_id, session_id)
-            await _db_call(delete_sessions_for_chat, token_id, session_id)
         elif code in (401, 403, 429):
             await _db_call(mark_limited, token_id)
-        logger.exception("stream_anthropic_response failed")
+            logger.warning("stream_anthropic_response upstream HTTP %s: %s", code, e)
+        else:
+            logger.exception("stream_anthropic_response failed")
+        try:
+            await _db_call(delete_sessions_for_chat, token_id, session_id)
+        except Exception:
+            logger.exception("stream_anthropic_response: dropping session %s failed", session_id)
         try:
             yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)[:300]}})}\n\n"
         except Exception:
